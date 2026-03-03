@@ -20,15 +20,17 @@ try:
     import pyautogui
     import keyboard
     from PIL import ImageGrab
+    import mss as _mss_lib
 except ImportError:
     import subprocess, sys
     print("Installing required packages...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "keyboard"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "keyboard", "mss"])
     import pyautogui
     import keyboard
     from PIL import ImageGrab
+    import mss as _mss_lib
 
-pyautogui.FAILSAFE = True  # Move mouse to top-left corner to abort
+pyautogui.FAILSAFE = False
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -44,31 +46,34 @@ def color_distance(c1, c2):
 def rgb_to_hex(rgb):
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
-def find_color_in_row(y, target_color, color_tolerance, x_start, x_end):
-    """Scan a horizontal region at row y to find the X position of target_color.
-    Returns the absolute X coordinate of the closest match, or None if no match within tolerance."""
-    img = ImageGrab.grab(bbox=(x_start, y, x_end, y + 1))
+def _scan_row(raw_bgra, width, target_rgb, tolerance):
+    """Find closest-match X in a 1-row mss BGRA buffer. Returns relative X or None."""
     best_x, best_dist = None, float("inf")
-    for x, c in enumerate(img.getdata()):
-        d = color_distance(c[:3], target_color)
+    for x in range(width):
+        i = x * 4
+        r, g, b = raw_bgra[i + 2], raw_bgra[i + 1], raw_bgra[i]
+        d = color_distance((r, g, b), target_rgb)
         if d < best_dist:
             best_dist = d
             best_x = x
-    return (x_start + best_x) if best_dist <= color_tolerance else None
+    return best_x if best_dist <= tolerance else None
 
-def find_color_zone_in_row(y, target_color, color_tolerance, x_start, x_end):
-    """Find the leftmost and rightmost X of all pixels matching target_color within tolerance.
-    Returns (x_left, x_right) or (None, None) if no pixels match."""
-    img = ImageGrab.grab(bbox=(x_start, y, x_end, y + 1))
+def _scan_zone(raw_bgra, width, target_rgb, tolerance):
+    """Find leftmost and rightmost matching X in a 1-row mss BGRA buffer. Returns (xl, xr) or (None, None)."""
     x_left = x_right = None
-    for x, c in enumerate(img.getdata()):
-        if color_distance(c[:3], target_color) <= color_tolerance:
+    for x in range(width):
+        i = x * 4
+        r, g, b = raw_bgra[i + 2], raw_bgra[i + 1], raw_bgra[i]
+        if color_distance((r, g, b), target_rgb) <= tolerance:
             if x_left is None:
                 x_left = x
             x_right = x
-    if x_left is None:
-        return None, None
-    return x_start + x_left, x_start + x_right
+    return x_left, x_right
+
+# ── Hardcoded target colours & tolerance ──────────────────────────────────────
+PIXEL_A_COLOR   = (0xbd, 0xec, 0x3f)  # #bdec3f — leaf
+PIXEL_B_COLOR   = (0xfc, 0xff, 0x7a)  # #fcff7a — green bar
+COLOR_TOLERANCE = 10                   # Euclidean RGB distance threshold
 
 # ── Main App ───────────────────────────────────────────────────────────────────
 
@@ -76,13 +81,13 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Color Match Auto-Clicker")
+        self.title("IdleOn Chopping Assistant")
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
 
         # State
         self.pixels = [None, None]       # (x, y) for each watch point
-        self.pixel_colors = [None, None] # target RGB color for each watch point
+        self.pixel_colors = [PIXEL_A_COLOR, PIXEL_B_COLOR]  # hardcoded target colours
         self.scan_area = None            # (x_start, x_end) scan bounds, None = full width
         self.click_pos = None             # where to click (defaults to pixel 1)
         self.running = False
@@ -110,13 +115,16 @@ class App(tk.Tk):
                         focusthickness=0, font=("Segoe UI", 10, "bold"), padding=6)
         style.map("TButton", background=[("active", HOT)])
 
-        header = tk.Label(self, text="🎯  Color Match Auto-Clicker",
+        header = tk.Label(self, text="🪓  IdleOn Chopping Assistant",
                           font=("Segoe UI", 14, "bold"), bg=BG, fg=HOT)
         header.pack(pady=(PAD, 4), padx=PAD)
 
-        sub = tk.Label(self, text="Click fires when Pixel A and Pixel B are vertically aligned",
+        sub = tk.Label(self, text="Click fires when the Leaf enters the Bar zone",
                        font=("Segoe UI", 9), bg=BG, fg="#888")
-        sub.pack(padx=PAD, pady=(0, PAD))
+        sub.pack(padx=PAD, pady=(0, 4))
+
+        tk.Label(self, text="Manually chop until the Gold bar appears, then press F6 to enable.",
+                 font=("Segoe UI", 9), bg=BG, fg="#666").pack(padx=PAD, pady=(0, PAD))
 
         # ── Pixel cards ──────────────────────────────────────────────────────
         self.pixel_frames = []
@@ -127,7 +135,7 @@ class App(tk.Tk):
         pixels_row = tk.Frame(self, bg=BG)
         pixels_row.pack(padx=PAD, fill="x")
 
-        for i, label in enumerate(("Pixel A", "Pixel B")):
+        for i, label in enumerate(("Leaf", "Bar")):
             card = tk.Frame(pixels_row, bg=CARD, padx=12, pady=10,
                             highlightbackground=ACC, highlightthickness=1)
             card.pack(side="left", expand=True, fill="both",
@@ -145,17 +153,19 @@ class App(tk.Tk):
             swatch_row = tk.Frame(card, bg=CARD)
             swatch_row.pack(anchor="w")
 
-            swatch = tk.Label(swatch_row, width=4, height=1, bg="#333",
+            _hex = rgb_to_hex(self.pixel_colors[i])
+            swatch = tk.Label(swatch_row, width=4, height=1, bg=_hex,
                               relief="flat", borderwidth=2)
             swatch.pack(side="left")
             self.color_swatches.append(swatch)
 
-            hex_lbl = tk.Label(swatch_row, text="  #------", font=MONO,
-                               bg=CARD, fg="#888")
+            hex_lbl = tk.Label(swatch_row, text=f"  {_hex}", font=MONO,
+                               bg=CARD, fg="#eaeaea")
             hex_lbl.pack(side="left", padx=4)
             self.hex_labels.append(hex_lbl)
 
-            btn = ttk.Button(card, text=f"Pick Pixel {chr(65+i)}",
+            btn_label = ("Select Leaf Area", "Select Chopping Bar (top half)")[i]
+            btn = ttk.Button(card, text=btn_label,
                              command=lambda idx=i: self._schedule_pick(idx))
             btn.pack(pady=(8, 0), fill="x")
 
@@ -183,74 +193,25 @@ class App(tk.Tk):
                                highlightbackground=ACC, highlightthickness=1)
         click_frame.pack(padx=PAD, pady=PAD, fill="x")
 
-        tk.Label(click_frame, text="Click Position  (defaults to Pixel A location)",
+        tk.Label(click_frame, text="Click Position  (select the CHOP icon)",
                  font=("Segoe UI", 9, "bold"), bg=CARD, fg="#aaa").pack(anchor="w")
 
-        self.click_coord_lbl = tk.Label(click_frame, text="Same as Pixel A",
-                                        font=MONO, bg=CARD, fg="#888")
+        self.click_coord_lbl = tk.Label(click_frame, text="Not set",
+                                        font=MONO, bg=CARD, fg="#aaa")
         self.click_coord_lbl.pack(anchor="w", pady=(2, 6))
 
         ttk.Button(click_frame, text="Pick Click Position",
                    command=lambda: self._schedule_pick("click")).pack(fill="x")
 
-        # ── Tolerance ─────────────────────────────────────────────────────────
-        tol_frame = tk.Frame(self, bg=BG)
-        tol_frame.pack(padx=PAD, fill="x")
-
-        tk.Label(tol_frame, text="Color Tolerance:", font=("Segoe UI", 9),
-                 bg=BG, fg=FG).pack(side="left")
-
-        self.tol_var = tk.IntVar(value=10)
-        self.tol_label = tk.Label(tol_frame, text="10", width=3,
-                                  font=("Segoe UI", 9, "bold"), bg=BG, fg=HOT)
-        self.tol_label.pack(side="right")
-
-        tol_slider = ttk.Scale(tol_frame, from_=0, to=100,
-                               variable=self.tol_var, orient="horizontal",
-                               command=lambda v: self.tol_label.config(
-                                   text=str(int(float(v)))))
-        tol_slider.pack(side="left", expand=True, fill="x", padx=8)
-
-        # ── Position Tolerance ────────────────────────────────────────────────
-        pos_frame = tk.Frame(self, bg=BG)
-        pos_frame.pack(padx=PAD, pady=(8, 0), fill="x")
-
-        tk.Label(pos_frame, text="Position Tolerance (px):", font=("Segoe UI", 9),
-                 bg=BG, fg=FG).pack(side="left")
-
-        self.pos_tol_var = tk.IntVar(value=5)
-        self.pos_tol_label = tk.Label(pos_frame, text="5", width=3,
-                                      font=("Segoe UI", 9, "bold"), bg=BG, fg=HOT)
-        self.pos_tol_label.pack(side="right")
-
-        pos_slider = ttk.Scale(pos_frame, from_=0, to=50,
-                               variable=self.pos_tol_var, orient="horizontal",
-                               command=lambda v: self.pos_tol_label.config(
-                                   text=str(int(float(v)))))
-        pos_slider.pack(side="left", expand=True, fill="x", padx=8)
-
-        # ── Trigger mode ──────────────────────────────────────────────────────
-        mode_frame = tk.Frame(self, bg=BG)
-        mode_frame.pack(padx=PAD, pady=(8, 0), fill="x")
-
-        tk.Label(mode_frame, text="Trigger Mode:", font=("Segoe UI", 9),
-                 bg=BG, fg=FG).pack(side="left")
-
-        self.zone_mode_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(mode_frame,
-                       text="Zone  (click while A is at or past B — use for red/green bar)",
-                       variable=self.zone_mode_var,
-                       bg=BG, fg=FG, selectcolor=ACC, activebackground=BG,
-                       font=("Segoe UI", 9)).pack(side="left", padx=8)
-
+        # ── Edge Trigger ──────────────────────────────────────────────────────
         edge_frame = tk.Frame(self, bg=BG)
-        edge_frame.pack(padx=PAD, pady=(2, 0), fill="x")
-        tk.Label(edge_frame, text="         ", bg=BG).pack(side="left")
+        edge_frame.pack(padx=PAD, pady=(8, 0), fill="x")
+
         self.edge_trigger_var = tk.BooleanVar(value=True)
         tk.Checkbutton(edge_frame,
-                       text="Edge trigger  (fire once per zone entry, re-arms on exit — best for bouncing elements)",
+                       text="Edge trigger  (fire once per zone entry, re-arms on exit)",
                        variable=self.edge_trigger_var,
-                       bg=BG, fg="#aaa", selectcolor=ACC, activebackground=BG,
+                       bg=BG, fg=FG, selectcolor=ACC, activebackground=BG,
                        font=("Segoe UI", 9)).pack(side="left")
 
         # ── Zone Inset ────────────────────────────────────────────────────────
@@ -271,18 +232,23 @@ class App(tk.Tk):
                                           text=str(int(float(v)))))
         zone_inset_slider.pack(side="left", expand=True, fill="x", padx=8)
 
-        # ── Click type ────────────────────────────────────────────────────────
-        type_frame = tk.Frame(self, bg=BG)
-        type_frame.pack(padx=PAD, pady=(PAD, 4), fill="x")
+        # ── Prediction ────────────────────────────────────────────────────────
+        pred_frame = tk.Frame(self, bg=BG)
+        pred_frame.pack(padx=PAD, pady=(4, 0), fill="x")
+        tk.Label(pred_frame, text="         ", bg=BG).pack(side="left")
+        tk.Label(pred_frame, text="Prediction (frames):", font=("Segoe UI", 9),
+                 bg=BG, fg="#aaa").pack(side="left")
 
-        tk.Label(type_frame, text="Click Type:", font=("Segoe UI", 9),
-                 bg=BG, fg=FG).pack(side="left")
+        self.lookahead_var = tk.IntVar(value=1)
+        self.lookahead_label = tk.Label(pred_frame, text="1", width=3,
+                                        font=("Segoe UI", 9, "bold"), bg=BG, fg=HOT)
+        self.lookahead_label.pack(side="right")
 
-        self.click_type = tk.StringVar(value="left")
-        for val, txt in (("left", "Left"), ("right", "Right"), ("double", "Double")):
-            tk.Radiobutton(type_frame, text=txt, variable=self.click_type, value=val,
-                           bg=BG, fg=FG, selectcolor=ACC, activebackground=BG,
-                           font=("Segoe UI", 9)).pack(side="left", padx=8)
+        pred_slider = ttk.Scale(pred_frame, from_=0, to=8,
+                                variable=self.lookahead_var, orient="horizontal",
+                                command=lambda v: self.lookahead_label.config(
+                                    text=str(int(float(v)))))
+        pred_slider.pack(side="left", expand=True, fill="x", padx=8)
 
         # ── Cooldown ──────────────────────────────────────────────────────────
         cool_frame = tk.Frame(self, bg=BG)
@@ -321,7 +287,7 @@ class App(tk.Tk):
         status.pack(fill="x", side="bottom")
 
         # Hotkey hint
-        tk.Label(self, text="Press  F6  to toggle anywhere  •  Move mouse to top-left to abort",
+        tk.Label(self, text="Press  F6  to toggle anywhere",
                  font=("Segoe UI", 8), bg=BG, fg="#555").pack(
             side="bottom", pady=(0, 2))
 
@@ -346,20 +312,14 @@ class App(tk.Tk):
         overlay.bind("<Button-1>", on_click)
 
     def _capture_pos(self, idx, x, y):
-        color = get_pixel_color(x, y)
-        hex_c = rgb_to_hex(color)
-
         if idx == "click":
             self.click_pos = (x, y)
             self.click_coord_lbl.config(text=f"({x}, {y})", fg="#eaeaea")
             self.status_var.set(f"Click position set → ({x}, {y})")
         else:
             self.pixels[idx] = (x, y)
-            self.pixel_colors[idx] = color
             self.coord_labels[idx].config(text=f"({x}, {y})", fg="#eaeaea")
-            self.color_swatches[idx].config(bg=hex_c)
-            self.hex_labels[idx].config(text=f"  {hex_c}", fg="#eaeaea")
-            self.status_var.set(f"Pixel {chr(65+idx)} set → ({x}, {y})  color {hex_c}")
+            self.status_var.set(f"Pixel {chr(65+idx)} set → ({x}, {y})")
 
     def _schedule_area_pick(self):
         self.status_var.set("Click and drag to define the scan area…")
@@ -426,8 +386,12 @@ class App(tk.Tk):
             self._start()
 
     def _start(self):
-        if None in self.pixels:
-            messagebox.showwarning("Not ready", "Please set both Pixel A and Pixel B first.")
+        if None in self.pixels or self.click_pos is None:
+            missing = []
+            if self.pixels[0] is None: missing.append("Leaf Area")
+            if self.pixels[1] is None: missing.append("Chopping Bar")
+            if self.click_pos is None:  missing.append("Click Position")
+            messagebox.showwarning("Not ready", f"Please set: {', '.join(missing)}")
             return
         self.running = True
         self.click_count = 0
@@ -447,133 +411,116 @@ class App(tk.Tk):
         color_a = self.pixel_colors[0]
         color_b = self.pixel_colors[1]
         cx, cy = self.click_pos if self.click_pos else self.pixels[0]
-        screen_width = pyautogui.size().width  # cache once
+        screen_width = pyautogui.size().width
 
         last_click = 0
-        last_x_a = None     # last known leaf X for local search
-        SEARCH_RADIUS = 120  # px window around last position before full scan
+        last_x_a = None
+        SEARCH_RADIUS = 120
+        was_in_zone = False
 
-        was_in_zone = False  # edge-trigger state: True while leaf is in zone
+        prev_x_a     = None   # previous leaf X for velocity calc
+        smoothed_vel = 0.0    # pixels/frame, exponential moving average
+        VEL_ALPHA    = 0.4    # EMA smoothing factor (higher = more reactive)
 
-        while self.running:
-            try:
-                tolerance  = self.tol_var.get()
-                cooldown   = self.cooldown_var.get()
-                click_type = self.click_type.get()
-                pos_tol    = self.pos_tol_var.get()
-                zone_mode  = self.zone_mode_var.get()
-                inset      = self.zone_inset_var.get()
+        with _mss_lib.mss() as sct:
+            while self.running:
+                try:
+                    tolerance  = COLOR_TOLERANCE
+                    cooldown   = self.cooldown_var.get()
+                    inset      = self.zone_inset_var.get()
 
-                x_start, x_end = self.scan_area if self.scan_area else (0, screen_width)
+                    x_start, x_end = self.scan_area if self.scan_area else (0, screen_width)
 
-                # Local search first, fall back to full scan
-                if last_x_a is not None:
-                    ls = max(x_start, last_x_a - SEARCH_RADIUS)
-                    le = min(x_end,   last_x_a + SEARCH_RADIUS)
-                    x_a = find_color_in_row(ay, color_a, tolerance, ls, le)
-                    if x_a is None:
-                        x_a = find_color_in_row(ay, color_a, tolerance, x_start, x_end)
-                else:
-                    x_a = find_color_in_row(ay, color_a, tolerance, x_start, x_end)
-                if x_a is not None:
-                    last_x_a = x_a
+                    # ── Leaf scan (Pixel A) — local search first ───────────────
+                    if last_x_a is not None:
+                        ls = max(x_start, last_x_a - SEARCH_RADIUS)
+                        le = min(x_end,   last_x_a + SEARCH_RADIUS)
+                    else:
+                        ls, le = x_start, x_end
 
-                now = time.time()
+                    shot_a = sct.grab({"left": ls, "top": ay, "width": max(1, le - ls), "height": 1})
+                    rel_a  = _scan_row(shot_a.raw, shot_a.width, color_a, tolerance)
+                    if rel_a is None and (ls != x_start or le != x_end):
+                        shot_a = sct.grab({"left": x_start, "top": ay, "width": max(1, x_end - x_start), "height": 1})
+                        rel_a  = _scan_row(shot_a.raw, shot_a.width, color_a, tolerance)
+                        x_a = (x_start + rel_a) if rel_a is not None else None
+                    else:
+                        x_a = (ls + rel_a) if rel_a is not None else None
 
-                if zone_mode:
-                    # Always scan fresh — no caching, accuracy over speed
-                    x_b_left, x_b_right = find_color_zone_in_row(by, color_b, tolerance, x_start, x_end)
+                    if x_a is not None:
+                        last_x_a = x_a
 
+                    # ── Velocity tracking ─────────────────────────────────────
+                    if x_a is not None:
+                        if prev_x_a is not None:
+                            raw_vel      = x_a - prev_x_a
+                            smoothed_vel = VEL_ALPHA * raw_vel + (1 - VEL_ALPHA) * smoothed_vel
+                        prev_x_a = x_a
+                    else:
+                        prev_x_a     = None
+                        smoothed_vel = 0.0
+
+                    # ── Zone scan (Pixel B) — always full range ────────────────
+                    shot_b  = sct.grab({"left": x_start, "top": by, "width": max(1, x_end - x_start), "height": 1})
+                    xl, xr  = _scan_zone(shot_b.raw, shot_b.width, color_b, tolerance)
+                    x_b_left  = (x_start + xl) if xl is not None else None
+                    x_b_right = (x_start + xr) if xr is not None else None
+
+                    # ── Zone check (actual + predicted) ───────────────────────
+                    lookahead = self.lookahead_var.get()
                     if x_a is None or x_b_left is None:
                         missing = ("Pixel A: not found  " if x_a is None else "") + \
                                   ("Pixel B zone: not found" if x_b_left is None else "")
                         self.after(0, lambda m=missing: self.status_var.set(f"Monitoring…  {m}"))
-                        should_click = False
+                        in_zone_actual    = False
+                        in_zone_predicted = False
                     else:
-                        # Apply inset: leaf must be comfortably inside zone boundaries
                         eff_left  = x_b_left  + inset
                         eff_right = x_b_right - inset
-                        in_zone = eff_left <= x_a <= eff_right
-                        self.after(0, lambda xa=x_a, bl=eff_left, br=eff_right, z=in_zone: self.status_var.set(
-                            f"Monitoring…  A@x={xa}  zone=[{bl}–{br}]  {'✓ IN ZONE' if z else '✗ out'}"))
-                        should_click = in_zone
-                else:
-                    x_b = find_color_in_row(by, color_b, tolerance, x_start, x_end)
-                    if x_a is None or x_b is None:
-                        missing = "  ".join(
-                            f"Pixel {chr(65+i)}: not found"
-                            for i, x in enumerate((x_a, x_b)) if x is None
-                        )
-                        self.after(0, lambda m=missing: self.status_var.set(f"Monitoring…  {m}"))
-                        should_click = False
-                    else:
-                        diff = abs(x_a - x_b)
-                        self.after(0, lambda xa=x_a, xb=x_b, d=diff: self.status_var.set(
-                            f"Monitoring…  A@x={xa}  B@x={xb}  diff={d}px"))
-                        should_click = diff <= pos_tol
+                        predicted_x       = x_a + smoothed_vel * lookahead
+                        in_zone_actual    = eff_left <= x_a          <= eff_right
+                        in_zone_predicted = eff_left <= predicted_x  <= eff_right
+                        self.after(0, lambda xa=x_a, px=round(predicted_x), bl=eff_left, br=eff_right, z=in_zone_predicted: self.status_var.set(
+                            f"Monitoring…  A@x={xa}→{px}  zone=[{bl}–{br}]  {'✓ IN ZONE' if z else '✗ out'}"))
 
-                # Determine whether to fire: edge trigger (zone mode only) or time-based cooldown
-                edge_trigger = zone_mode and self.edge_trigger_var.get()
-                if edge_trigger:
-                    if x_a is not None and x_b_left is not None:
-                        if should_click and not was_in_zone:
-                            fire = True
+                    # ── Fire decision ─────────────────────────────────────────
+                    # Trigger on predicted position; re-arm on actual position
+                    now = time.time()
+                    if self.edge_trigger_var.get():
+                        if x_a is not None and x_b_left is not None:
+                            fire        = in_zone_predicted and not was_in_zone and (now - last_click) >= cooldown
+                            was_in_zone = in_zone_actual
                         else:
                             fire = False
-                        was_in_zone = should_click
                     else:
-                        fire = False
-                else:
-                    fire = should_click and (now - last_click) >= cooldown
+                        fire = in_zone_predicted and (now - last_click) >= cooldown
 
-                if fire:
-                    # Pre-click verification: fresh grab confirms leaf is still in zone
-                    # before committing the click — eliminates latency-caused misfires
-                    if zone_mode:
-                        x_a_v = find_color_in_row(ay, color_a, tolerance, x_start, x_end)
-                        xl_v, xr_v = find_color_zone_in_row(by, color_b, tolerance, x_start, x_end)
-                        confirmed = (x_a_v is not None and xl_v is not None and
-                                     (xl_v + inset) <= x_a_v <= (xr_v - inset))
-                    else:
-                        confirmed = True
-
-                    if confirmed:
-                        if click_type == "double":
-                            pyautogui.doubleClick(cx, cy)
-                        elif click_type == "right":
-                            pyautogui.rightClick(cx, cy)
-                        else:
-                            pyautogui.click(cx, cy)
+                    # ── Click ─────────────────────────────────────────────────
+                    if fire:
+                        pyautogui.click(cx, cy)
                         last_click = now
                         self.click_count += 1
                         self.after(0, lambda n=self.click_count, xa=x_a: self.status_var.set(
                             f"✅ Click #{n}  (A@x={xa})"))
-                    else:
-                        # Leaf moved out between detection and click — skip and re-arm
-                        was_in_zone = False
-                        self.after(0, lambda: self.status_var.set(
-                            "⚠ Verification failed — leaf moved, skipped"))
 
-                time.sleep(0.01)  # ~100 fps polling
-
-            except Exception as e:
-                self.after(0, lambda err=e: self.status_var.set(f"Error: {err}"))
-                break
+                except Exception as e:
+                    self.after(0, lambda err=e: self.status_var.set(f"Error: {err}"))
+                    break
 
     # ── Misc ───────────────────────────────────────────────────────────────────
 
     def _reset(self):
         self._stop()
         self.pixels = [None, None]
-        self.pixel_colors = [None, None]
+        self.pixel_colors = [PIXEL_A_COLOR, PIXEL_B_COLOR]
         self.scan_area = None
         self.click_pos = None
         for i in range(2):
             self.coord_labels[i].config(text="Not set", fg="#aaa")
-            self.color_swatches[i].config(bg="#333")
-            self.hex_labels[i].config(text="  #------", fg="#888")
+            self.color_swatches[i].config(bg=rgb_to_hex(self.pixel_colors[i]))
+            self.hex_labels[i].config(text=f"  {rgb_to_hex(self.pixel_colors[i])}", fg="#eaeaea")
         self.scan_area_lbl.config(text="Full screen width", fg="#888")
-        self.click_coord_lbl.config(text="Same as Pixel A", fg="#888")
+        self.click_coord_lbl.config(text="Not set", fg="#aaa")
         self.status_var.set("Reset.  Set both pixels to begin.")
 
     def _on_close(self):
