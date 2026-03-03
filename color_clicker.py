@@ -1,14 +1,4 @@
-"""
-Color Match Auto-Clicker
-========================
-Watches two screen pixels and clicks the mouse when their colors match.
-
-Requirements:
-    pip install pyautogui pillow keyboard
-
-Usage:
-    python color_clicker.py
-"""
+"""IdleOn Chopping Assistant — clicks when the leaf enters the bar zone."""
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -19,35 +9,26 @@ import math
 try:
     import pyautogui
     import keyboard
-    from PIL import ImageGrab
     import mss as _mss_lib
 except ImportError:
     import subprocess, sys
     print("Installing required packages...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyautogui", "pillow", "keyboard", "mss"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyautogui", "keyboard", "mss"])
     import pyautogui
     import keyboard
-    from PIL import ImageGrab
     import mss as _mss_lib
 
 pyautogui.FAILSAFE = False
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def get_pixel_color(x, y):
-    """Return (r, g, b) of a single pixel."""
-    img = ImageGrab.grab(bbox=(x, y, x + 1, y + 1))
-    return img.getpixel((0, 0))[:3]
-
 def color_distance(c1, c2):
-    """Euclidean distance between two RGB colours."""
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
 
 def rgb_to_hex(rgb):
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 def _scan_row(raw_bgra, width, target_rgb, tolerance):
-    """Find closest-match X in a 1-row mss BGRA buffer. Returns relative X or None."""
     best_x, best_dist = None, float("inf")
     for x in range(width):
         i = x * 4
@@ -59,7 +40,6 @@ def _scan_row(raw_bgra, width, target_rgb, tolerance):
     return best_x if best_dist <= tolerance else None
 
 def _scan_zone(raw_bgra, width, target_rgb, tolerance):
-    """Find leftmost and rightmost matching X in a 1-row mss BGRA buffer. Returns (xl, xr) or (None, None)."""
     x_left = x_right = None
     for x in range(width):
         i = x * 4
@@ -85,13 +65,10 @@ class App(tk.Tk):
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
 
-        # State
-        self.pixels = [None, None]       # (x, y) for each watch point
-        self.pixel_colors = [PIXEL_A_COLOR, PIXEL_B_COLOR]  # hardcoded target colours
-        self.scan_area = None            # (x_start, x_end) scan bounds, None = full width
-        self.click_pos = None             # where to click (defaults to pixel 1)
-        self.running = False
-        self.monitor_thread = None
+        self.pixels    = [None, None]
+        self.scan_area = None
+        self.click_pos = None
+        self.running   = False
         self.click_count = 0
 
         self._build_ui()
@@ -100,7 +77,7 @@ class App(tk.Tk):
     # ── UI ─────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        PAD = 16
+        PAD  = 16
         BG   = "#1a1a2e"
         CARD = "#16213e"
         ACC  = "#0f3460"
@@ -115,59 +92,43 @@ class App(tk.Tk):
                         focusthickness=0, font=("Segoe UI", 10, "bold"), padding=6)
         style.map("TButton", background=[("active", HOT)])
 
-        header = tk.Label(self, text="🪓  IdleOn Chopping Assistant",
-                          font=("Segoe UI", 14, "bold"), bg=BG, fg=HOT)
-        header.pack(pady=(PAD, 4), padx=PAD)
-
-        sub = tk.Label(self, text="Click fires when the Leaf enters the Bar zone",
-                       font=("Segoe UI", 9), bg=BG, fg="#888")
-        sub.pack(padx=PAD, pady=(0, 4))
-
+        tk.Label(self, text="🪓  IdleOn Chopping Assistant",
+                 font=("Segoe UI", 14, "bold"), bg=BG, fg=HOT).pack(pady=(PAD, 4), padx=PAD)
+        tk.Label(self, text="Click fires when the Leaf enters the Bar zone",
+                 font=("Segoe UI", 9), bg=BG, fg="#888").pack(padx=PAD, pady=(0, 4))
         tk.Label(self, text="Manually chop until the Gold bar appears, then press F6 to enable.",
                  font=("Segoe UI", 9), bg=BG, fg="#666").pack(padx=PAD, pady=(0, PAD))
 
         # ── Pixel cards ──────────────────────────────────────────────────────
-        self.pixel_frames = []
         self.coord_labels = []
-        self.color_swatches = []
-        self.hex_labels = []
-
         pixels_row = tk.Frame(self, bg=BG)
         pixels_row.pack(padx=PAD, fill="x")
 
-        for i, label in enumerate(("Leaf", "Bar")):
+        for i, (label, color, btn_text) in enumerate((
+            ("Leaf", PIXEL_A_COLOR, "Select Leaf Area"),
+            ("Bar",  PIXEL_B_COLOR, "Select Chopping Bar (top half)"),
+        )):
             card = tk.Frame(pixels_row, bg=CARD, padx=12, pady=10,
                             highlightbackground=ACC, highlightthickness=1)
-            card.pack(side="left", expand=True, fill="both",
-                      padx=(0 if i == 0 else 8, 0))
-            self.pixel_frames.append(card)
+            card.pack(side="left", expand=True, fill="both", padx=(0 if i == 0 else 8, 0))
 
             tk.Label(card, text=label, font=("Segoe UI", 10, "bold"),
                      bg=CARD, fg=FG).pack(anchor="w")
 
-            coord = tk.Label(card, text="Not set", font=MONO,
-                             bg=CARD, fg="#aaa")
+            coord = tk.Label(card, text="Not set", font=MONO, bg=CARD, fg="#aaa")
             coord.pack(anchor="w", pady=(2, 6))
             self.coord_labels.append(coord)
 
+            _hex = rgb_to_hex(color)
             swatch_row = tk.Frame(card, bg=CARD)
             swatch_row.pack(anchor="w")
+            tk.Label(swatch_row, width=4, height=1, bg=_hex,
+                     relief="flat", borderwidth=2).pack(side="left")
+            tk.Label(swatch_row, text=f"  {_hex}", font=MONO,
+                     bg=CARD, fg=FG).pack(side="left", padx=4)
 
-            _hex = rgb_to_hex(self.pixel_colors[i])
-            swatch = tk.Label(swatch_row, width=4, height=1, bg=_hex,
-                              relief="flat", borderwidth=2)
-            swatch.pack(side="left")
-            self.color_swatches.append(swatch)
-
-            hex_lbl = tk.Label(swatch_row, text=f"  {_hex}", font=MONO,
-                               bg=CARD, fg="#eaeaea")
-            hex_lbl.pack(side="left", padx=4)
-            self.hex_labels.append(hex_lbl)
-
-            btn_label = ("Select Leaf Area", "Select Chopping Bar (top half)")[i]
-            btn = ttk.Button(card, text=btn_label,
-                             command=lambda idx=i: self._schedule_pick(idx))
-            btn.pack(pady=(8, 0), fill="x")
+            ttk.Button(card, text=btn_text,
+                       command=lambda idx=i: self._schedule_pick(idx)).pack(pady=(8, 0), fill="x")
 
         # ── Scan area ─────────────────────────────────────────────────────────
         scan_frame = tk.Frame(self, bg=CARD, padx=12, pady=10,
@@ -176,9 +137,7 @@ class App(tk.Tk):
 
         tk.Label(scan_frame, text="Scan Area  (defaults to full screen width)",
                  font=("Segoe UI", 9, "bold"), bg=CARD, fg="#aaa").pack(anchor="w")
-
-        self.scan_area_lbl = tk.Label(scan_frame, text="Full screen width",
-                                      font=MONO, bg=CARD, fg="#888")
+        self.scan_area_lbl = tk.Label(scan_frame, text="Full screen width", font=MONO, bg=CARD, fg="#888")
         self.scan_area_lbl.pack(anchor="w", pady=(2, 6))
 
         scan_btn_row = tk.Frame(scan_frame, bg=CARD)
@@ -195,18 +154,14 @@ class App(tk.Tk):
 
         tk.Label(click_frame, text="Click Position  (select the CHOP icon)",
                  font=("Segoe UI", 9, "bold"), bg=CARD, fg="#aaa").pack(anchor="w")
-
-        self.click_coord_lbl = tk.Label(click_frame, text="Not set",
-                                        font=MONO, bg=CARD, fg="#aaa")
+        self.click_coord_lbl = tk.Label(click_frame, text="Not set", font=MONO, bg=CARD, fg="#aaa")
         self.click_coord_lbl.pack(anchor="w", pady=(2, 6))
-
         ttk.Button(click_frame, text="Pick Click Position",
                    command=lambda: self._schedule_pick("click")).pack(fill="x")
 
         # ── Edge Trigger ──────────────────────────────────────────────────────
         edge_frame = tk.Frame(self, bg=BG)
         edge_frame.pack(padx=PAD, pady=(8, 0), fill="x")
-
         self.edge_trigger_var = tk.BooleanVar(value=True)
         tk.Checkbutton(edge_frame,
                        text="Edge trigger  (fire once per zone entry, re-arms on exit)",
@@ -220,17 +175,13 @@ class App(tk.Tk):
         tk.Label(inset_frame, text="         ", bg=BG).pack(side="left")
         tk.Label(inset_frame, text="Zone Inset (px):", font=("Segoe UI", 9),
                  bg=BG, fg="#aaa").pack(side="left")
-
         self.zone_inset_var = tk.IntVar(value=5)
         self.zone_inset_label = tk.Label(inset_frame, text="5", width=3,
                                          font=("Segoe UI", 9, "bold"), bg=BG, fg=HOT)
         self.zone_inset_label.pack(side="right")
-
-        zone_inset_slider = ttk.Scale(inset_frame, from_=0, to=30,
-                                      variable=self.zone_inset_var, orient="horizontal",
-                                      command=lambda v: self.zone_inset_label.config(
-                                          text=str(int(float(v)))))
-        zone_inset_slider.pack(side="left", expand=True, fill="x", padx=8)
+        ttk.Scale(inset_frame, from_=0, to=30, variable=self.zone_inset_var, orient="horizontal",
+                  command=lambda v: self.zone_inset_label.config(
+                      text=str(int(float(v))))).pack(side="left", expand=True, fill="x", padx=8)
 
         # ── Prediction ────────────────────────────────────────────────────────
         pred_frame = tk.Frame(self, bg=BG)
@@ -238,58 +189,41 @@ class App(tk.Tk):
         tk.Label(pred_frame, text="         ", bg=BG).pack(side="left")
         tk.Label(pred_frame, text="Prediction (frames):", font=("Segoe UI", 9),
                  bg=BG, fg="#aaa").pack(side="left")
-
         self.lookahead_var = tk.IntVar(value=1)
         self.lookahead_label = tk.Label(pred_frame, text="1", width=3,
                                         font=("Segoe UI", 9, "bold"), bg=BG, fg=HOT)
         self.lookahead_label.pack(side="right")
-
-        pred_slider = ttk.Scale(pred_frame, from_=0, to=8,
-                                variable=self.lookahead_var, orient="horizontal",
-                                command=lambda v: self.lookahead_label.config(
-                                    text=str(int(float(v)))))
-        pred_slider.pack(side="left", expand=True, fill="x", padx=8)
+        ttk.Scale(pred_frame, from_=0, to=8, variable=self.lookahead_var, orient="horizontal",
+                  command=lambda v: self.lookahead_label.config(
+                      text=str(int(float(v))))).pack(side="left", expand=True, fill="x", padx=8)
 
         # ── Cooldown ──────────────────────────────────────────────────────────
         cool_frame = tk.Frame(self, bg=BG)
         cool_frame.pack(padx=PAD, pady=(0, PAD), fill="x")
-
         tk.Label(cool_frame, text="Cooldown (s):", font=("Segoe UI", 9),
                  bg=BG, fg=FG).pack(side="left")
-
         self.cooldown_var = tk.DoubleVar(value=0.5)
         self.cool_label = tk.Label(cool_frame, text="0.50", width=4,
                                    font=("Segoe UI", 9, "bold"), bg=BG, fg=HOT)
         self.cool_label.pack(side="right")
-
-        cool_slider = ttk.Scale(cool_frame, from_=0.0, to=5.0,
-                                variable=self.cooldown_var, orient="horizontal",
-                                command=lambda v: self.cool_label.config(
-                                    text=f"{float(v):.2f}"))
-        cool_slider.pack(side="left", expand=True, fill="x", padx=8)
+        ttk.Scale(cool_frame, from_=0.0, to=5.0, variable=self.cooldown_var, orient="horizontal",
+                  command=lambda v: self.cool_label.config(
+                      text=f"{float(v):.2f}")).pack(side="left", expand=True, fill="x", padx=8)
 
         # ── Start / Stop ──────────────────────────────────────────────────────
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(padx=PAD, pady=(0, 8), fill="x")
-
-        self.start_btn = ttk.Button(btn_row, text="▶  Start",
-                                    command=self._toggle)
+        self.start_btn = ttk.Button(btn_row, text="▶  Start", command=self._toggle)
         self.start_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-
         ttk.Button(btn_row, text="Reset", command=self._reset).pack(
             side="left", expand=True, fill="x", padx=(4, 0))
 
         # ── Status bar ────────────────────────────────────────────────────────
         self.status_var = tk.StringVar(value="Set both pixels to begin.")
-        status = tk.Label(self, textvariable=self.status_var,
-                          font=("Segoe UI", 9), bg=ACC, fg=FG,
-                          anchor="w", padx=8, pady=4)
-        status.pack(fill="x", side="bottom")
-
-        # Hotkey hint
+        tk.Label(self, textvariable=self.status_var, font=("Segoe UI", 9),
+                 bg=ACC, fg=FG, anchor="w", padx=8, pady=4).pack(fill="x", side="bottom")
         tk.Label(self, text="Press  F6  to toggle anywhere",
-                 font=("Segoe UI", 8), bg=BG, fg="#555").pack(
-            side="bottom", pady=(0, 2))
+                 font=("Segoe UI", 8), bg=BG, fg="#555").pack(side="bottom", pady=(0, 2))
 
         keyboard.add_hotkey("F6", self._toggle)
 
@@ -331,7 +265,6 @@ class App(tk.Tk):
 
         canvas = tk.Canvas(overlay, bg="#1a1a2e", highlightthickness=0)
         canvas.pack(fill="both", expand=True)
-
         canvas.create_text(
             overlay.winfo_screenwidth() // 2, 40,
             text="Click and drag to define scan area  •  Esc to cancel",
@@ -353,8 +286,7 @@ class App(tk.Tk):
             )
 
         def on_release(event):
-            x1 = min(start["x"], event.x)
-            x2 = max(start["x"], event.x)
+            x1, x2 = min(start["x"], event.x), max(start["x"], event.x)
             overlay.destroy()
             if x2 - x1 > 4:  # ignore accidental tiny drags
                 self._set_scan_area(x1, x2)
@@ -368,8 +300,7 @@ class App(tk.Tk):
 
     def _set_scan_area(self, x1, x2):
         self.scan_area = (x1, x2)
-        self.scan_area_lbl.config(
-            text=f"x: {x1}–{x2}  ({x2 - x1}px wide)", fg="#eaeaea")
+        self.scan_area_lbl.config(text=f"x: {x1}–{x2}  ({x2 - x1}px wide)", fg="#eaeaea")
         self.status_var.set(f"Scan area set → x:{x1}–{x2}  ({x2 - x1}px wide)")
 
     def _clear_scan_area(self):
@@ -397,8 +328,7 @@ class App(tk.Tk):
         self.click_count = 0
         self.start_btn.config(text="■  Stop")
         self.status_var.set("Monitoring…  (F6 or Stop button to halt)")
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.monitor_thread.start()
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
 
     def _stop(self):
         self.running = False
@@ -408,27 +338,22 @@ class App(tk.Tk):
     def _monitor_loop(self):
         ay = self.pixels[0][1]
         by = self.pixels[1][1]
-        color_a = self.pixel_colors[0]
-        color_b = self.pixel_colors[1]
-        cx, cy = self.click_pos if self.click_pos else self.pixels[0]
+        cx, cy = self.click_pos
         screen_width = pyautogui.size().width
 
-        last_click = 0
-        last_x_a = None
+        last_click    = 0
+        last_x_a      = None
         SEARCH_RADIUS = 120
-        was_in_zone = False
-
-        prev_x_a     = None   # previous leaf X for velocity calc
-        smoothed_vel = 0.0    # pixels/frame, exponential moving average
-        VEL_ALPHA    = 0.4    # EMA smoothing factor (higher = more reactive)
+        was_in_zone   = False
+        prev_x_a      = None
+        smoothed_vel  = 0.0
+        VEL_ALPHA     = 0.4
 
         with _mss_lib.mss() as sct:
             while self.running:
                 try:
-                    tolerance  = COLOR_TOLERANCE
-                    cooldown   = self.cooldown_var.get()
-                    inset      = self.zone_inset_var.get()
-
+                    cooldown = self.cooldown_var.get()
+                    inset    = self.zone_inset_var.get()
                     x_start, x_end = self.scan_area if self.scan_area else (0, screen_width)
 
                     # ── Leaf scan (Pixel A) — local search first ───────────────
@@ -439,10 +364,10 @@ class App(tk.Tk):
                         ls, le = x_start, x_end
 
                     shot_a = sct.grab({"left": ls, "top": ay, "width": max(1, le - ls), "height": 1})
-                    rel_a  = _scan_row(shot_a.raw, shot_a.width, color_a, tolerance)
+                    rel_a  = _scan_row(shot_a.raw, shot_a.width, PIXEL_A_COLOR, COLOR_TOLERANCE)
                     if rel_a is None and (ls != x_start or le != x_end):
                         shot_a = sct.grab({"left": x_start, "top": ay, "width": max(1, x_end - x_start), "height": 1})
-                        rel_a  = _scan_row(shot_a.raw, shot_a.width, color_a, tolerance)
+                        rel_a  = _scan_row(shot_a.raw, shot_a.width, PIXEL_A_COLOR, COLOR_TOLERANCE)
                         x_a = (x_start + rel_a) if rel_a is not None else None
                     else:
                         x_a = (ls + rel_a) if rel_a is not None else None
@@ -461,8 +386,8 @@ class App(tk.Tk):
                         smoothed_vel = 0.0
 
                     # ── Zone scan (Pixel B) — always full range ────────────────
-                    shot_b  = sct.grab({"left": x_start, "top": by, "width": max(1, x_end - x_start), "height": 1})
-                    xl, xr  = _scan_zone(shot_b.raw, shot_b.width, color_b, tolerance)
+                    shot_b = sct.grab({"left": x_start, "top": by, "width": max(1, x_end - x_start), "height": 1})
+                    xl, xr = _scan_zone(shot_b.raw, shot_b.width, PIXEL_B_COLOR, COLOR_TOLERANCE)
                     x_b_left  = (x_start + xl) if xl is not None else None
                     x_b_right = (x_start + xr) if xr is not None else None
 
@@ -472,19 +397,17 @@ class App(tk.Tk):
                         missing = ("Pixel A: not found  " if x_a is None else "") + \
                                   ("Pixel B zone: not found" if x_b_left is None else "")
                         self.after(0, lambda m=missing: self.status_var.set(f"Monitoring…  {m}"))
-                        in_zone_actual    = False
-                        in_zone_predicted = False
+                        in_zone_actual = in_zone_predicted = False
                     else:
                         eff_left  = x_b_left  + inset
                         eff_right = x_b_right - inset
                         predicted_x       = x_a + smoothed_vel * lookahead
-                        in_zone_actual    = eff_left <= x_a          <= eff_right
-                        in_zone_predicted = eff_left <= predicted_x  <= eff_right
-                        self.after(0, lambda xa=x_a, px=round(predicted_x), bl=eff_left, br=eff_right, z=in_zone_predicted: self.status_var.set(
-                            f"Monitoring…  A@x={xa}→{px}  zone=[{bl}–{br}]  {'✓ IN ZONE' if z else '✗ out'}"))
+                        in_zone_actual    = eff_left <= x_a         <= eff_right
+                        in_zone_predicted = eff_left <= predicted_x <= eff_right
+                        self.after(0, lambda xa=x_a, px=round(predicted_x), bl=eff_left, br=eff_right, z=in_zone_predicted:
+                            self.status_var.set(f"Monitoring…  A@x={xa}→{px}  zone=[{bl}–{br}]  {'✓ IN ZONE' if z else '✗ out'}"))
 
                     # ── Fire decision ─────────────────────────────────────────
-                    # Trigger on predicted position; re-arm on actual position
                     now = time.time()
                     if self.edge_trigger_var.get():
                         if x_a is not None and x_b_left is not None:
@@ -495,13 +418,12 @@ class App(tk.Tk):
                     else:
                         fire = in_zone_predicted and (now - last_click) >= cooldown
 
-                    # ── Click ─────────────────────────────────────────────────
                     if fire:
                         pyautogui.click(cx, cy)
                         last_click = now
                         self.click_count += 1
-                        self.after(0, lambda n=self.click_count, xa=x_a: self.status_var.set(
-                            f"✅ Click #{n}  (A@x={xa})"))
+                        self.after(0, lambda n=self.click_count, xa=x_a:
+                            self.status_var.set(f"✅ Click #{n}  (A@x={xa})"))
 
                 except Exception as e:
                     self.after(0, lambda err=e: self.status_var.set(f"Error: {err}"))
@@ -511,14 +433,11 @@ class App(tk.Tk):
 
     def _reset(self):
         self._stop()
-        self.pixels = [None, None]
-        self.pixel_colors = [PIXEL_A_COLOR, PIXEL_B_COLOR]
+        self.pixels    = [None, None]
         self.scan_area = None
         self.click_pos = None
         for i in range(2):
             self.coord_labels[i].config(text="Not set", fg="#aaa")
-            self.color_swatches[i].config(bg=rgb_to_hex(self.pixel_colors[i]))
-            self.hex_labels[i].config(text=f"  {rgb_to_hex(self.pixel_colors[i])}", fg="#eaeaea")
         self.scan_area_lbl.config(text="Full screen width", fg="#888")
         self.click_coord_lbl.config(text="Not set", fg="#aaa")
         self.status_var.set("Reset.  Set both pixels to begin.")
@@ -530,5 +449,4 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()
